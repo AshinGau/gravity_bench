@@ -7,7 +7,7 @@ use alloy::{
 
 use crate::{
     config::IERC20,
-    eth::{BENCH_MAX_FEE_PER_GAS, BENCH_MAX_PRIORITY_FEE_PER_GAS},
+    eth::{max_fee_per_gas, max_priority_fee_per_gas},
     txn_plan::traits::FromTxnConstructor,
     util::gen_account::{AccountId, AccountManager},
 };
@@ -53,8 +53,8 @@ impl FromTxnConstructor for ApproveTokenConstructor {
             .with_input(call_data)
             .with_nonce(nonce)
             .with_chain_id(self.chain_id)
-            .with_max_priority_fee_per_gas(BENCH_MAX_PRIORITY_FEE_PER_GAS)
-            .with_max_fee_per_gas(BENCH_MAX_FEE_PER_GAS)
+            .with_max_priority_fee_per_gas(max_priority_fee_per_gas())
+            .with_max_fee_per_gas(max_fee_per_gas())
             .with_gas_limit(100_000); // Standard gas for approve
 
         Ok(tx_request)

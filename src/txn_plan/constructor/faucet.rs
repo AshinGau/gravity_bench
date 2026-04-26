@@ -1,4 +1,5 @@
 use crate::{
+    eth::gas_cost_per_txn_budget,
     txn_plan::{
         faucet_plan::LevelFaucetPlan, faucet_txn_builder::FaucetTxnBuilder, traits::TxnPlan,
     },
@@ -14,15 +15,6 @@ use std::{
     sync::{atomic::AtomicU64, Arc, Mutex},
 };
 use tracing::info;
-
-// Per-transaction gas cost budget (in wei) used by the faucet plan to reserve
-// enough ETH on each intermediate account to cover its outgoing transactions.
-//
-// Value = max_fee_per_gas * worst-case gas_limit. With BENCH_MAX_FEE_PER_GAS
-// at 100 Gwei and worst-case per-txn gas around 100k (contract calls), the
-// budget is 1e16 wei = 0.01 ETH per txn, leaving headroom for tip and
-// rounding. Bumping max_fee_per_gas requires bumping this in lockstep.
-const GAS_COST_PER_TXN_BUDGET: u64 = 10_000_000_000_000_000;
 
 static NONCE_MAP: std::sync::OnceLock<Arc<Mutex<HashMap<Address, Arc<AtomicU64>>>>> =
     std::sync::OnceLock::new();
@@ -64,7 +56,7 @@ impl<T: FaucetTxnBuilder + 'static> FaucetTreePlanBuilder<T> {
         let round_total_accounts_num = degree.pow(total_levels as u32);
 
         let degree_u256 = U256::from(degree);
-        let gas_cost_per_txn = U256::from(GAS_COST_PER_TXN_BUDGET);
+        let gas_cost_per_txn = U256::from(gas_cost_per_txn_budget());
 
         let (amount_per_recipient, intermediate_funding_amounts) = if total_levels > 1 {
             // This is a multi-level distribution.

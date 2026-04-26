@@ -3,6 +3,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::path::Path;
 
+use crate::eth::DEFAULT_TX_GAS_PRICE_WEI;
+
 /// Address pool type selection
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -27,10 +29,18 @@ pub struct BenchConfig {
     pub address_pool_type: AddressPoolType,
     #[serde(default = "default_log_path")]
     pub log_path: String,
+    /// Max fee per gas (wei) used for every benchmark txn. Sized so the
+    /// effective fee covers the target chain's base fee plus a 1 Gwei tip.
+    #[serde(default = "default_tx_gas_price")]
+    pub tx_gas_price: u64,
 }
 
 fn default_log_path() -> String {
     "./log.log".to_string()
+}
+
+fn default_tx_gas_price() -> u64 {
+    DEFAULT_TX_GAS_PRICE_WEI as u64
 }
 
 /// Node and chain configuration

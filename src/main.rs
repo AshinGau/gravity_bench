@@ -24,7 +24,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 use crate::{
     actors::{consumer::Consumer, producer::Producer, Monitor, RegisterTxnPlan},
     config::{BenchConfig, ContractConfig},
-    eth::EthHttpCli,
+    eth::{init_gas_config, EthHttpCli},
     txn_plan::{
         addr_pool::AddressPool,
         constructor::FaucetTreePlanBuilder,
@@ -276,6 +276,7 @@ async fn start_bench() -> Result<()> {
     let args = Args::parse();
     let benchmark_config = BenchConfig::load(&args.config).unwrap();
     assert!(benchmark_config.accounts.num_accounts >= benchmark_config.target_tps as usize);
+    init_gas_config(benchmark_config.tx_gas_price as u128);
 
     // Initialize tracing
     let log_path = benchmark_config.log_path.trim();
