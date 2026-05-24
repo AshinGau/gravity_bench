@@ -1,3 +1,4 @@
+pub mod block_monitor;
 pub mod consumer;
 pub mod monitor;
 pub mod producer;

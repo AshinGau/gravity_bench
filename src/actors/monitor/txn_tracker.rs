@@ -693,6 +693,62 @@ impl TxnTracker {
         retry_queue
     }
 
+    /// Handle TxnSubmitted message from receipt mode Consumer.
+    /// Just increments consumed_transactions for plan tracking.
+    pub fn handle_txn_submitted(&mut self, msg: &super::TxnSubmitted) {
+        let plan_id = &msg.metadata.plan_id;
+        if let Some(tracker) = self.plan_trackers.get_mut(plan_id) {
+            tracker.consumed_transactions += 1;
+            debug!(
+                "TxnSubmitted: plan_id={}, tx_hash={:?}, consumed={}",
+                plan_id, msg.tx_hash, tracker.consumed_transactions
+            );
+        } else {
+            warn!(
+                "TxnSubmitted: plan not found: plan_id={}, tx_hash={:?}",
+                plan_id, msg.tx_hash
+            );
+        }
+    }
+
+    /// Handle TxnConfirmed message from BlockMonitor.
+    /// Records latency, increments resolved, checks plan completion.
+    pub fn handle_txn_confirmed(&mut self, msg: &super::TxnConfirmed) {
+        let plan_id = &msg.metadata.plan_id;
+
+        // Push latency for stats
+        self.latencies.push_back(msg.latency);
+        if self.latencies.len() > 1000 {
+            self.latencies.pop_front();
+        }
+
+        if let Some(tracker) = self.plan_trackers.get_mut(plan_id) {
+            if tracker.resolved_hashes.insert(msg.tx_hash) {
+                tracker.resolved_transactions += 1;
+                self.resolved_txn_timestamps.push_back(Instant::now());
+                self.total_resolved_transactions += 1;
+                if !msg.status {
+                    tracker.failed_executions += 1;
+                    self.total_failed_executions += 1;
+                }
+                debug!(
+                    "TxnConfirmed: plan_id={}, tx_hash={}, latency={:?}, status={}",
+                    plan_id, msg.tx_hash, msg.latency, msg.status
+                );
+            } else {
+                debug!(
+                    "TxnConfirmed: duplicate resolution skipped: plan_id={}, tx_hash={}",
+                    plan_id, msg.tx_hash
+                );
+            }
+        } else {
+            warn!(
+                "TxnConfirmed: plan not found: plan_id={}, tx_hash={}",
+                plan_id, msg.tx_hash
+            );
+        }
+    }
+
     pub fn log_stats(&mut self) {
         // Update TPS window by removing timestamps older than 30 seconds
         let now = Instant::now();

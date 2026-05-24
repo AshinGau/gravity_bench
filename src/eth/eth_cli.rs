@@ -445,6 +445,28 @@ impl EthHttpCli {
         result.with_context(|| format!("Failed to get transaction receipt for hash: {:?}", tx_hash))
     }
 
+    /// Get block by number with full transaction objects
+    pub async fn get_block_by_number(
+        &self,
+        block_number: u64,
+    ) -> Result<Option<alloy::rpc::types::Block>> {
+        use alloy::eips::BlockNumberOrTag;
+        let start = Instant::now();
+
+        let result = self
+            .retry_with_backoff(|| async {
+                self.inner[0]
+                    .get_block_by_number(BlockNumberOrTag::Number(block_number))
+                    .full()
+                    .await
+            })
+            .await;
+
+        self.update_metrics("eth_getBlockByNumber", result.is_ok(), start.elapsed()).await;
+
+        result.with_context(|| format!("Failed to get block {}", block_number))
+    }
+
     pub async fn get_latest_txn_count(&self, address: &Address) -> Result<u64> {
         tokio::time::timeout(Duration::from_secs(10), async {
             let nonce = self.inner[0].get_transaction_count(*address).latest().await?;

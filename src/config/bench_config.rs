@@ -61,12 +61,18 @@ pub struct NodeConfig {
     pub chain_id: u64,
 }
 
-fn from_str_to_u256<'de, D>(deserializer: D) -> Result<U256, D::Error>
+
+
+/// Parse a decimal string as ETH and convert to wei (× 1e18).
+/// Example: "100" → 100 ETH → 100000000000000000000 wei
+fn from_eth_str_to_u256<'de, D>(deserializer: D) -> Result<U256, D::Error>
 where
     D: Deserializer<'de>,
 {
     let s = String::deserialize(deserializer)?;
-    Ok(U256::from_str_radix(&s, 10).map_err(serde::de::Error::custom)?)
+    let eth: f64 = s.parse().map_err(serde::de::Error::custom)?;
+    let wei = (eth * 1e18) as u128;
+    Ok(U256::from(wei))
 }
 
 /// Faucet and deployer account configuration
@@ -75,8 +81,8 @@ pub struct FaucetConfig {
     pub private_key: String,
     pub faucet_level: u32,
     pub wait_duration_secs: u64,
-    #[serde(deserialize_with = "from_str_to_u256")]
-    pub fauce_eth_balance: U256,
+    #[serde(deserialize_with = "from_eth_str_to_u256")]
+    pub faucet_eth_balance: U256,
 }
 
 /// Load testing account configuration

@@ -28,7 +28,9 @@ faucet_level = 10
 # Wait duration in seconds between faucet distribution levels
 # If you encounter 'insufficient funds' errors, try increasing this value
 wait_duration_secs = 60
-fauce_eth_balance = "100000000000000000000"
+# Faucet ETH balance for this experiment (in ETH, not wei).
+# Covers initial distribution + all refaucet. Example: 100 = 100 ETH
+faucet_eth_balance = 1000000
 
 # Load testing account configuration
 [accounts]

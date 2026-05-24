@@ -1,4 +1,3 @@
-pub mod balance_tracker;
 mod mempool_tracker;
 
 pub mod monitor_actor;
@@ -6,7 +5,8 @@ mod txn_tracker;
 
 use actix::Message;
 use alloy::primitives::{Address, TxHash};
-use std::{sync::Arc, time::Instant};
+use std::time::{Duration, Instant};
+use std::sync::Arc;
 
 use crate::txn_plan::{PlanId, TxnMetadata};
 
@@ -40,16 +40,12 @@ pub enum SubmissionResult {
     },
     ErrorWithRetry,
     Success(TxHash),
-    /// Transaction confirmed on-chain with receipt data.
-    /// Contains gas cost info for balance tracking.
     SuccessWithReceipt {
         tx_hash: TxHash,
         gas_used: u128,
         effective_gas_price: u128,
         status: bool,
     },
-    /// Insufficient balance to submit transaction. The transaction was never sent.
-    /// Nonce should NOT be advanced; account should be retried after re-faucet.
     InsufficientBalance,
 }
 
@@ -98,25 +94,6 @@ pub struct RetryTxn {
     pub metadata: Arc<TxnMetadata>,
 }
 
-/// Message sent to Producer when an account needs re-faucet
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct RefaucetNeeded {
-    pub account: Address,
-    #[allow(unused)]
-    pub account_id: crate::util::gen_account::AccountId,
-}
-
-/// Message to initialize balance tracking for all leaf accounts after faucet distribution
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct InitBalances {
-    /// Addresses of all leaf accounts
-    pub addresses: Vec<Address>,
-    /// Initial balance for each account (in wei)
-    pub balance_per_account: alloy::primitives::U256,
-}
-
 /// Information for correcting account nonce
 #[derive(Debug, Clone)]
 pub struct NonceCorrectionInfo {
@@ -129,6 +106,39 @@ pub struct NonceCorrectionInfo {
 #[rtype(result = "()")]
 pub struct CorrectNonces {
     pub corrections: Vec<NonceCorrectionInfo>,
+}
+
+// --- New messages for BlockMonitor-driven receipt mode ---
+
+/// Message from BlockMonitor when a transaction receipt is confirmed
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct TxnConfirmed {
+    pub tx_hash: TxHash,
+    pub latency: Duration,
+    pub gas_used: u128,
+    pub effective_gas_price: u128,
+    pub status: bool,
+    pub metadata: Arc<TxnMetadata>,
+}
+
+/// Message from Consumer: tx submitted but waiting for BlockMonitor confirmation
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct TxnSubmitted {
+    pub tx_hash: TxHash,
+    pub metadata: Arc<TxnMetadata>,
+    pub rpc_url: String,
+    pub send_time: Instant,
+    pub signed_bytes: Arc<Vec<u8>>,
+}
+
+/// Message from Monitor to Producer: receipt confirmed, unlock nonce
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct ReceiptConfirmed {
+    pub metadata: Arc<TxnMetadata>,
+    pub status: bool,
 }
 
 pub use monitor_actor::Monitor;

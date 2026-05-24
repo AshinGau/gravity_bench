@@ -26,7 +26,6 @@ pub struct TxnMetadata {
     /// Whether this is a re-faucet transaction (ETH transfer to replenish balance)
     pub is_refaucet: bool,
     /// When is_refaucet is true, the address of the account receiving the re-faucet ETH.
-    /// This is the depleted account, not the faucet sender.
     pub refaucet_target: Option<Address>,
 }
 

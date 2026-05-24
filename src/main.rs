@@ -398,7 +398,7 @@ async fn start_bench() -> Result<()> {
     }
     let eth_faucet_builder = PlanBuilder::create_faucet_tree_plan_builder(
         benchmark_config.faucet.faucet_level as usize,
-        benchmark_config.faucet.fauce_eth_balance,
+        benchmark_config.faucet.faucet_eth_balance,
         &benchmark_config.faucet.private_key,
         start_nonce,
         account_addresses.clone(),
@@ -416,20 +416,12 @@ async fn start_bench() -> Result<()> {
     if args.recover {
         init_nonce(&mut accout_generator, eth_clients[0].clone()).await;
     }
-    let mut monitor = Monitor::new_with_clients(
+    let monitor = Monitor::new_with_clients(
         eth_clients.clone(),
         benchmark_config.performance.max_pool_size,
         benchmark_config.performance.sampling,
         args.receipt,
     );
-    // Enable balance tracking in receipt mode
-    if args.receipt {
-        // Threshold: enough for 10 transactions at max_fee_per_gas
-        let threshold_gwei = benchmark_config.max_fee_per_gas * 100_000 * 10;
-        monitor.enable_balance_tracking(threshold_gwei, benchmark_config.refaucet_amount);
-        info!("Receipt mode: balance tracking enabled (threshold={} Gwei, refaucet={} ETH)",
-              threshold_gwei, benchmark_config.refaucet_amount);
-    }
     let monitor = monitor.start();
 
     let tokens = contract_config.get_all_token();
@@ -484,6 +476,14 @@ async fn start_bench() -> Result<()> {
         .map(|client| (**client).clone()) // Clone the actual EthHttpCli instead of creating new ones
         .collect();
 
+    // Create BlockMonitor channel for receipt mode
+    let (block_monitor_tx, block_monitor_rx) = if args.receipt {
+        let (tx, rx) = tokio::sync::mpsc::channel(100_000);
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
+
     let consumer = Consumer::new_with_providers(
         eth_providers,
         benchmark_config.performance.num_senders,
@@ -491,6 +491,7 @@ async fn start_bench() -> Result<()> {
         benchmark_config.performance.max_pool_size,
         Some(benchmark_config.target_tps as u32),
         args.receipt,
+        block_monitor_tx,
     )
     .start();
     let init_nonce_map = get_init_nonce_map(
@@ -500,11 +501,29 @@ async fn start_bench() -> Result<()> {
     )
     .await;
 
-    let producer = Producer::new(address_pool.clone(), consumer, monitor.clone(), account_manager.clone(), chain_id, benchmark_config.refaucet_amount)
+    let producer = Producer::new(address_pool.clone(), consumer, monitor.clone(), account_manager.clone())
         .await
         .unwrap()
         .start();
-    let amount_per_recipient = eth_faucet_builder.amount_per_recipient();
+
+    // Start BlockMonitor task in receipt mode
+    if args.receipt {
+        let bm_monitor = monitor.clone();
+        let bm_clients: Vec<Arc<EthHttpCli>> = eth_clients.clone();
+        let bm_rx = block_monitor_rx.unwrap();
+        tokio::spawn(async move {
+            let block_monitor = crate::actors::block_monitor::BlockMonitor::new(
+                bm_monitor,
+                bm_clients,
+                bm_rx,
+                None,
+            );
+            block_monitor.run().await;
+        });
+        info!("BlockMonitor started for receipt mode");
+    }
+
+    let _amount_per_recipient = eth_faucet_builder.amount_per_recipient();
     execute_faucet_distribution(
         eth_faucet_builder,
         chain_id,
@@ -514,19 +533,6 @@ async fn start_bench() -> Result<()> {
         init_nonce_map.clone(),
     )
     .await?;
-
-    // Initialize balance tracker for receipt mode
-    if args.receipt {
-        use crate::actors::monitor::InitBalances;
-        let addresses: Vec<alloy::primitives::Address> = account_addresses
-            .iter()
-            .map(|a| **a)
-            .collect();
-        monitor.do_send(InitBalances {
-            addresses,
-            balance_per_account: amount_per_recipient,
-        });
-    }
 
     for (token_plan, token) in tokens_plan.into_iter().zip(tokens.iter()) {
         execute_faucet_distribution(

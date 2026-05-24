@@ -13,8 +13,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     actors::{
+        block_monitor::PendingTxInfo,
         consumer::dispatcher::{Dispatcher, SimpleDispatcher},
-        monitor::{RegisterConsumer, RetryTxn, SubmissionResult, UpdateSubmissionResult},
+        monitor::{RegisterConsumer, RetryTxn, SubmissionResult, TxnSubmitted, UpdateSubmissionResult},
         Monitor,
     },
     eth::EthHttpCli,
@@ -146,8 +147,10 @@ pub struct Consumer {
     pool_receiver: Option<mpsc::Receiver<SignedTxnWithMetadata>>,
     /// Pool maximum capacity
     max_pool_size: usize,
-    /// When true, wait for on-chain receipt before reporting success
+    /// When true, use BlockMonitor for receipt tracking instead of fire-and-forget
     receipt_mode: bool,
+    /// Channel to register txs with BlockMonitor (receipt mode only)
+    block_monitor_tx: Option<mpsc::Sender<PendingTxInfo>>,
 }
 
 /// Consumer statistics
@@ -170,6 +173,7 @@ impl Consumer {
         max_pool_size: usize,
         max_tps: Option<u32>,
         receipt_mode: bool,
+        block_monitor_tx: Option<mpsc::Sender<PendingTxInfo>>,
     ) -> Self {
         let (pool_sender, pool_receiver) = mpsc::channel(max_pool_size);
         let rate_limiter = match max_tps {
@@ -187,6 +191,7 @@ impl Consumer {
             pool_receiver: Some(pool_receiver),
             max_pool_size,
             receipt_mode,
+            block_monitor_tx,
         }
     }
 
@@ -199,6 +204,7 @@ impl Consumer {
         transactions_sent: Arc<AtomicU64>,
         transactions_sending: Arc<AtomicU64>,
         receipt_mode: bool,
+        block_monitor_tx: Option<mpsc::Sender<PendingTxInfo>>,
     ) {
         let metadata = signed_txn.metadata;
         debug!("Acquired permit, processing transaction: {:?}", metadata.txn_id);
@@ -224,35 +230,24 @@ impl Consumer {
                     );
 
                     if receipt_mode {
-                        // Wait for on-chain receipt before reporting success
-                        match Self::wait_for_receipt(&dispatcher, &rpc_url, tx_hash).await {
-                            Ok(receipt) => {
-                                let status = receipt.status();
-                                monitor_addr.do_send(UpdateSubmissionResult {
-                                    metadata,
-                                    result: Arc::new(SubmissionResult::SuccessWithReceipt {
-                                        tx_hash,
-                                        gas_used: receipt.gas_used as u128,
-                                        effective_gas_price: receipt.effective_gas_price as u128,
-                                        status,
-                                    }),
-                                    rpc_url,
-                                    send_time: Instant::now(),
-                                    signed_bytes: Arc::new(signed_txn.bytes.clone()),
-                                });
-                            }
-                            Err(e) => {
-                                warn!("Receipt wait failed for txn {:?}: {}", metadata.txn_id, e);
-                                // Treat as retry-able error
-                                monitor_addr.do_send(UpdateSubmissionResult {
-                                    metadata,
-                                    result: Arc::new(SubmissionResult::ErrorWithRetry),
-                                    rpc_url,
-                                    send_time: Instant::now(),
-                                    signed_bytes: Arc::new(signed_txn.bytes.clone()),
-                                });
-                            }
+                        // Register with BlockMonitor for async receipt tracking
+                        if let Some(bm_sender) = &block_monitor_tx {
+                            let _ = bm_sender.try_send(PendingTxInfo {
+                                tx_hash,
+                                metadata: metadata.clone(),
+                                submit_time: Instant::now(),
+                                rpc_url: rpc_url.clone(),
+                            });
                         }
+                        // Notify Monitor that tx was consumed (for plan tracking)
+                        // Do NOT send UpdateSubmissionResult — nonce unlock waits for receipt
+                        monitor_addr.do_send(TxnSubmitted {
+                            tx_hash,
+                            metadata: metadata.clone(),
+                            rpc_url,
+                            send_time: Instant::now(),
+                            signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                        });
                     } else {
                         // Fire-and-forget mode: report success immediately
                         monitor_addr.do_send(UpdateSubmissionResult {
@@ -430,49 +425,6 @@ impl Consumer {
         transactions_sending.fetch_sub(1, Ordering::Relaxed);
     }
 
-    /// Poll for transaction receipt with exponential backoff.
-    /// Returns the receipt on success, or an error if timeout is reached.
-    async fn wait_for_receipt(
-        dispatcher: &Arc<dyn Dispatcher>,
-        rpc_url: &str,
-        tx_hash: alloy::primitives::TxHash,
-    ) -> Result<alloy::rpc::types::TransactionReceipt, anyhow::Error> {
-        let provider = dispatcher.provider(rpc_url).await?;
-        let mut delay = Duration::from_millis(500);
-        let max_delay = Duration::from_secs(5);
-        let max_attempts = 60; // ~5 min total with exponential backoff
-
-        for attempt in 1..=max_attempts {
-            match provider.get_transaction_receipt(tx_hash).await {
-                Ok(Some(receipt)) => {
-                    debug!(
-                        "Receipt received for {} on attempt {}: status={}",
-                        tx_hash,
-                        attempt,
-                        receipt.status()
-                    );
-                    return Ok(receipt);
-                }
-                Ok(None) => {
-                    // Not yet mined, wait and retry
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, max_delay);
-                }
-                Err(e) => {
-                    warn!("RPC error polling receipt for {} (attempt {}): {}", tx_hash, attempt, e);
-                    tokio::time::sleep(delay).await;
-                    delay = std::cmp::min(delay * 2, max_delay);
-                }
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "Receipt timeout for tx {} after {} attempts",
-            tx_hash,
-            max_attempts
-        ))
-    }
-
     /// Create new TxnConsumer instance (convenience method, using SimpleDispatcher)
     pub fn new_with_providers(
         providers: Vec<EthHttpCli>,
@@ -481,9 +433,10 @@ impl Consumer {
         max_pool_size: usize,
         max_tps: Option<u32>,
         receipt_mode: bool,
+        block_monitor_tx: Option<mpsc::Sender<PendingTxInfo>>,
     ) -> Consumer {
         let dispatcher = Arc::new(SimpleDispatcher::new(providers));
-        Consumer::new(dispatcher, max_concurrent_senders, monitor_addr, max_pool_size, max_tps, receipt_mode)
+        Consumer::new(dispatcher, max_concurrent_senders, monitor_addr, max_pool_size, max_tps, receipt_mode, block_monitor_tx)
     }
 
     /// Start transaction pool consumer
@@ -500,6 +453,7 @@ impl Consumer {
         let rate_limiter = self.rate_limiter.clone();
         let rate_limited_count = self.stats.transactions_rate_limited.clone();
         let receipt_mode = self.receipt_mode;
+        let block_monitor_tx = self.block_monitor_tx.clone();
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -565,6 +519,7 @@ impl Consumer {
                                 transactions_sent.clone(),
                                 transactions_sending.clone(),
                                 receipt_mode,
+                                block_monitor_tx.clone(),
                             ));
                         }
 

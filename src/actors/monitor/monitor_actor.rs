@@ -15,15 +15,13 @@ use crate::txn_plan::PlanId;
 use super::mempool_tracker::MempoolAction;
 use super::txn_tracker::{BackpressureAction, PlanStatus, TxnTracker};
 use super::{
-    CorrectNonces, InitBalances, PlanCompleted, PlanFailed, RefaucetNeeded, RegisterConsumer,
+    CorrectNonces, PlanCompleted, PlanFailed, RegisterConsumer,
     RegisterPlan, RegisterProducer, ReportProducerStats, RetryTxn, SubmissionResult, Tick,
-    UpdateSubmissionResult,
+    TxnConfirmed, TxnSubmitted, UpdateSubmissionResult, ReceiptConfirmed,
 };
 use crate::actors::{PauseProducer, ResumeProducer};
 
 use crate::config::SamplingPolicy;
-
-use super::balance_tracker::BalanceTracker;
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -39,8 +37,6 @@ pub struct Monitor {
     txn_tracker: TxnTracker,
     mempool_tracker: MempoolTracker,
     clients: Arc<HashMap<Arc<String>, Arc<EthHttpCli>>>,
-    /// Per-account ETH balance tracker (only active in receipt mode)
-    balance_tracker: Option<BalanceTracker>,
     /// When true, skip txpool_content nonce correction (unnecessary with per-tx receipt)
     receipt_mode: bool,
 }
@@ -58,16 +54,8 @@ impl Monitor {
             txn_tracker: TxnTracker::new(clients.clone(), sampling_policy),
             mempool_tracker: MempoolTracker::new(max_pool_size),
             clients: Arc::new(clients.into_iter().map(|client| (client.rpc(), client)).collect()),
-            balance_tracker: None,
             receipt_mode,
         }
-    }
-
-    /// Enable balance tracking for receipt mode.
-    /// `threshold_gwei`: re-faucet when balance drops below this (Gwei)
-    /// `refaucet_eth`: amount to re-faucet (whole ETH)
-    pub fn enable_balance_tracking(&mut self, threshold_gwei: u64, refaucet_eth: u64) {
-        self.balance_tracker = Some(BalanceTracker::new(threshold_gwei, refaucet_eth));
     }
 
     /// Notify Producer of plan status changes
@@ -210,80 +198,18 @@ impl Handler<UpdateSubmissionResult> for Monitor {
         }
 
         match msg.result.as_ref() {
-            SubmissionResult::SuccessWithReceipt { gas_used, effective_gas_price, .. } => {
-                if msg.metadata.is_refaucet {
-                    // This is a re-faucet transaction — credit the target (depleted) account
-                    if let Some(tracker) = &mut self.balance_tracker {
-                        if let Some(target_addr) = msg.metadata.refaucet_target {
-                            let refaucet_amount = tracker.refaucet_amount();
-                            tracker.credit(&target_addr, refaucet_amount);
-                            tracing::info!("Re-faucet confirmed for {:?}, credited {} wei", target_addr, refaucet_amount);
-                        }
-                    }
-                } else {
-                    // Normal transaction — deduct gas and check if re-faucet is needed
-                    if let Some(tracker) = &mut self.balance_tracker {
-                        let address = msg.metadata.from_account.as_ref();
-                        if let Some(remaining) = tracker.deduct_gas(address, *gas_used, *effective_gas_price) {
-                            if tracker.needs_refaucet(address) {
-                                let refaucet_amount = tracker.refaucet_amount();
-                                tracing::info!(
-                                    "Account {:?} balance low ({} wei), requesting re-faucet of {} wei",
-                                    address, remaining, refaucet_amount
-                                );
-                                if let Some(producer) = &self.producer_addr {
-                                    producer.do_send(RefaucetNeeded {
-                                        account: *address,
-                                        account_id: msg.metadata.from_account_id,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
-                // Also pass to txn_tracker for plan completion tracking
+            SubmissionResult::SuccessWithReceipt { .. } => {
+                // Pass to txn_tracker for plan completion tracking
                 self.txn_tracker.handle_submission_result(&msg);
             }
-            SubmissionResult::InsufficientBalance => {
-                // Transaction never sent due to low balance — trigger re-faucet
-                if self.balance_tracker.is_some() {
-                    let address = msg.metadata.from_account.as_ref();
-                    tracing::info!(
-                        "Insufficient balance for {:?}, requesting re-faucet",
-                        address
-                    );
-                    if let Some(producer) = &self.producer_addr {
-                        producer.do_send(RefaucetNeeded {
-                            account: *address,
-                            account_id: msg.metadata.from_account_id,
-                        });
-                    }
-                }
-                // Do NOT tell txn_tracker — the transaction was never submitted
-                // The Producer will put the account back in the ready pool
-            }
             SubmissionResult::ErrorWithRetry => {
-                // If the transaction failed submission, retry it endlessly to prevent nonce gaps
-                // and premature plan completion. Do NOT tell TxnTracker about the failure yet.
+                // In simplified mode, treat as failed submission
                 tracing::warn!(
-                    "Transaction failed submission (ErrorWithRetry). Retrying via Consumer. plan_id={}, tx_hash={:?}",
+                    "Transaction failed submission (ErrorWithRetry). plan_id={}, tx_hash={:?}",
                     msg.metadata.plan_id,
                     msg.metadata.txn_id
                 );
-
-                if let Some(consumer) = &self.consumer_addr {
-                    consumer.do_send(RetryTxn {
-                        signed_bytes: msg.signed_bytes.clone(),
-                        metadata: msg.metadata.clone(),
-                    });
-                } else {
-                    tracing::error!(
-                        "Cannot retry transaction, no consumer address: {:?}",
-                        msg.metadata.txn_id
-                    );
-                    // Fallback to tracker if no consumer (will mark as failed)
-                    self.txn_tracker.handle_submission_result(&msg);
-                }
+                self.txn_tracker.handle_submission_result(&msg);
             }
             _ => {
                 self.txn_tracker.handle_submission_result(&msg);
@@ -311,24 +237,26 @@ impl Handler<Tick> for Monitor {
             BackpressureAction::None => {}
         }
 
-        // 2. Perform sampling check
-        let tasks = self.txn_tracker.perform_sampling_check();
-        let consumer_addr = self.consumer_addr.clone();
-        if !tasks.is_empty() {
-            ctx.spawn(future::join_all(tasks).into_actor(self).map(move |results, act, _ctx| {
-                // Process results and get retry queue
-                let retry_queue = act.txn_tracker.handle_receipt_result(results);
+        // 2. Perform sampling check (only in non-receipt mode)
+        if !self.receipt_mode {
+            let tasks = self.txn_tracker.perform_sampling_check();
+            let consumer_addr = self.consumer_addr.clone();
+            if !tasks.is_empty() {
+                ctx.spawn(future::join_all(tasks).into_actor(self).map(move |results, act, _ctx| {
+                    // Process results and get retry queue
+                    let retry_queue = act.txn_tracker.handle_receipt_result(results);
 
-                // 3. Send retries to consumer
-                if let Some(consumer) = &consumer_addr {
-                    for retry_txn in retry_queue {
-                        consumer.do_send(RetryTxn {
-                            signed_bytes: retry_txn.signed_bytes,
-                            metadata: retry_txn.metadata,
-                        });
+                    // 3. Send retries to consumer
+                    if let Some(consumer) = &consumer_addr {
+                        for retry_txn in retry_queue {
+                            consumer.do_send(RetryTxn {
+                                signed_bytes: retry_txn.signed_bytes,
+                                metadata: retry_txn.metadata,
+                            });
+                        }
                     }
-                }
-            }));
+                }));
+            }
         }
 
         // Check completion status of all plans
@@ -395,18 +323,40 @@ impl Handler<PlanFailed> for Monitor {
     }
 }
 
-impl Handler<InitBalances> for Monitor {
+/// Handler for TxnSubmitted: tx was sent to RPC, registered with BlockMonitor.
+/// Only used in receipt mode. Increments consumed_transactions for plan tracking.
+impl Handler<TxnSubmitted> for Monitor {
     type Result = ();
 
-    fn handle(&mut self, msg: InitBalances, _ctx: &mut Self::Context) {
-        if let Some(tracker) = &mut self.balance_tracker {
-            for address in &msg.addresses {
-                tracker.set_balance(*address, msg.balance_per_account);
-            }
-            tracing::info!(
-                "Balance tracker initialized for {} accounts ({} wei each)",
-                msg.addresses.len(),
-                msg.balance_per_account
+    fn handle(&mut self, msg: TxnSubmitted, _ctx: &mut Self::Context) {
+        self.txn_tracker.handle_txn_submitted(&msg);
+    }
+}
+
+/// Handler for TxnConfirmed: BlockMonitor confirmed a transaction receipt.
+/// Records latency, plan tracking, and forwards to Producer for nonce unlock.
+impl Handler<TxnConfirmed> for Monitor {
+    type Result = ();
+
+    fn handle(&mut self, msg: TxnConfirmed, _ctx: &mut Self::Context) {
+        // Record in TxnTracker (latency, plan completion, TPS)
+        self.txn_tracker.handle_txn_confirmed(&msg);
+
+        // Forward to Producer to unlock nonce
+        if let Some(producer_addr) = &self.producer_addr {
+            producer_addr.do_send(ReceiptConfirmed {
+                metadata: msg.metadata.clone(),
+                status: msg.status,
+            });
+        }
+
+        // Log reverted txs
+        if !msg.status {
+            tracing::warn!(
+                "Transaction reverted on-chain: tx_hash={}, gas_used={}, effective_gas_price={}",
+                msg.tx_hash,
+                msg.gas_used,
+                msg.effective_gas_price
             );
         }
     }
