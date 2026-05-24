@@ -27,10 +27,31 @@ pub struct BenchConfig {
     pub address_pool_type: AddressPoolType,
     #[serde(default = "default_log_path")]
     pub log_path: String,
+    /// Max fee per gas in Gwei (default: 5000)
+    #[serde(default = "default_max_fee_per_gas")]
+    pub max_fee_per_gas: u64,
+    /// Max priority fee per gas in Gwei (default: 500)
+    #[serde(default = "default_max_priority_fee_per_gas")]
+    pub max_priority_fee_per_gas: u64,
+    /// Re-faucet amount in ETH when account balance runs low (default: 1)
+    #[serde(default = "default_refaucet_amount")]
+    pub refaucet_amount: u64,
 }
 
 fn default_log_path() -> String {
     "./log.log".to_string()
+}
+
+fn default_max_fee_per_gas() -> u64 {
+    5000
+}
+
+fn default_max_priority_fee_per_gas() -> u64 {
+    500
+}
+
+fn default_refaucet_amount() -> u64 {
+    1
 }
 
 /// Node and chain configuration

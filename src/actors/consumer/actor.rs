@@ -146,6 +146,8 @@ pub struct Consumer {
     pool_receiver: Option<mpsc::Receiver<SignedTxnWithMetadata>>,
     /// Pool maximum capacity
     max_pool_size: usize,
+    /// When true, wait for on-chain receipt before reporting success
+    receipt_mode: bool,
 }
 
 /// Consumer statistics
@@ -167,6 +169,7 @@ impl Consumer {
         monitor_addr: Addr<Monitor>,
         max_pool_size: usize,
         max_tps: Option<u32>,
+        receipt_mode: bool,
     ) -> Self {
         let (pool_sender, pool_receiver) = mpsc::channel(max_pool_size);
         let rate_limiter = match max_tps {
@@ -183,6 +186,7 @@ impl Consumer {
             pool_sender,
             pool_receiver: Some(pool_receiver),
             max_pool_size,
+            receipt_mode,
         }
     }
 
@@ -194,6 +198,7 @@ impl Consumer {
         monitor_addr: Addr<Monitor>,
         transactions_sent: Arc<AtomicU64>,
         transactions_sending: Arc<AtomicU64>,
+        receipt_mode: bool,
     ) {
         let metadata = signed_txn.metadata;
         debug!("Acquired permit, processing transaction: {:?}", metadata.txn_id);
@@ -217,13 +222,47 @@ impl Consumer {
                         metadata.from_account,
                         tx_hash,
                     );
-                    monitor_addr.do_send(UpdateSubmissionResult {
-                        metadata,
-                        result: Arc::new(SubmissionResult::Success(tx_hash)),
-                        rpc_url,
-                        send_time: Instant::now(),
-                        signed_bytes: Arc::new(signed_txn.bytes.clone()),
-                    });
+
+                    if receipt_mode {
+                        // Wait for on-chain receipt before reporting success
+                        match Self::wait_for_receipt(&dispatcher, &rpc_url, tx_hash).await {
+                            Ok(receipt) => {
+                                let status = receipt.status();
+                                monitor_addr.do_send(UpdateSubmissionResult {
+                                    metadata,
+                                    result: Arc::new(SubmissionResult::SuccessWithReceipt {
+                                        tx_hash,
+                                        gas_used: receipt.gas_used as u128,
+                                        effective_gas_price: receipt.effective_gas_price as u128,
+                                        status,
+                                    }),
+                                    rpc_url,
+                                    send_time: Instant::now(),
+                                    signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                                });
+                            }
+                            Err(e) => {
+                                warn!("Receipt wait failed for txn {:?}: {}", metadata.txn_id, e);
+                                // Treat as retry-able error
+                                monitor_addr.do_send(UpdateSubmissionResult {
+                                    metadata,
+                                    result: Arc::new(SubmissionResult::ErrorWithRetry),
+                                    rpc_url,
+                                    send_time: Instant::now(),
+                                    signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                                });
+                            }
+                        }
+                    } else {
+                        // Fire-and-forget mode: report success immediately
+                        monitor_addr.do_send(UpdateSubmissionResult {
+                            metadata,
+                            result: Arc::new(SubmissionResult::Success(tx_hash)),
+                            rpc_url,
+                            send_time: Instant::now(),
+                            signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                        });
+                    }
 
                     // Update statistics and return early
                     transactions_sending.fetch_sub(1, Ordering::Relaxed);
@@ -278,7 +317,24 @@ impl Consumer {
                     // These errors will never succeed no matter how many times we retry
                     if error_string.contains("insufficient funds")
                         || error_string.contains("insufficient balance")
-                        || error_string.contains("gas limit exceeded")
+                    {
+                        error!(
+                            "Insufficient balance for txn {:?}: {}, account will be re-fauceted if in receipt mode",
+                            metadata.txn_id, e
+                        );
+                        // Use InsufficientBalance: nonce is NOT advanced, account stays in ready pool
+                        // with the same nonce for retry after re-faucet.
+                        monitor_addr.do_send(UpdateSubmissionResult {
+                            metadata,
+                            result: Arc::new(SubmissionResult::InsufficientBalance),
+                            rpc_url: url,
+                            send_time: Instant::now(),
+                            signed_bytes: Arc::new(signed_txn.bytes.clone()),
+                        });
+                        transactions_sending.fetch_sub(1, Ordering::Relaxed);
+                        return;
+                    }
+                    if error_string.contains("gas limit exceeded")
                         || error_string.contains("exceeds block gas limit")
                         || error_string.contains("intrinsic gas too low")
                     {
@@ -286,8 +342,6 @@ impl Consumer {
                             "Permanent error for txn {:?}: {}, marking as failed (no retry)",
                             metadata.txn_id, e
                         );
-                        // Treat as NonceTooLow with placeholder values - this will mark as resolved
-                        // without infinite retry. The transaction is dropped.
                         monitor_addr.do_send(UpdateSubmissionResult {
                             metadata,
                             result: Arc::new(SubmissionResult::NonceTooLow {
@@ -376,6 +430,49 @@ impl Consumer {
         transactions_sending.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Poll for transaction receipt with exponential backoff.
+    /// Returns the receipt on success, or an error if timeout is reached.
+    async fn wait_for_receipt(
+        dispatcher: &Arc<dyn Dispatcher>,
+        rpc_url: &str,
+        tx_hash: alloy::primitives::TxHash,
+    ) -> Result<alloy::rpc::types::TransactionReceipt, anyhow::Error> {
+        let provider = dispatcher.provider(rpc_url).await?;
+        let mut delay = Duration::from_millis(500);
+        let max_delay = Duration::from_secs(5);
+        let max_attempts = 60; // ~5 min total with exponential backoff
+
+        for attempt in 1..=max_attempts {
+            match provider.get_transaction_receipt(tx_hash).await {
+                Ok(Some(receipt)) => {
+                    debug!(
+                        "Receipt received for {} on attempt {}: status={}",
+                        tx_hash,
+                        attempt,
+                        receipt.status()
+                    );
+                    return Ok(receipt);
+                }
+                Ok(None) => {
+                    // Not yet mined, wait and retry
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, max_delay);
+                }
+                Err(e) => {
+                    warn!("RPC error polling receipt for {} (attempt {}): {}", tx_hash, attempt, e);
+                    tokio::time::sleep(delay).await;
+                    delay = std::cmp::min(delay * 2, max_delay);
+                }
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Receipt timeout for tx {} after {} attempts",
+            tx_hash,
+            max_attempts
+        ))
+    }
+
     /// Create new TxnConsumer instance (convenience method, using SimpleDispatcher)
     pub fn new_with_providers(
         providers: Vec<EthHttpCli>,
@@ -383,9 +480,10 @@ impl Consumer {
         monitor_addr: Addr<Monitor>,
         max_pool_size: usize,
         max_tps: Option<u32>,
+        receipt_mode: bool,
     ) -> Consumer {
         let dispatcher = Arc::new(SimpleDispatcher::new(providers));
-        Consumer::new(dispatcher, max_concurrent_senders, monitor_addr, max_pool_size, max_tps)
+        Consumer::new(dispatcher, max_concurrent_senders, monitor_addr, max_pool_size, max_tps, receipt_mode)
     }
 
     /// Start transaction pool consumer
@@ -401,6 +499,7 @@ impl Consumer {
         let transactions_sending = self.stats.transactions_sending.clone();
         let rate_limiter = self.rate_limiter.clone();
         let rate_limited_count = self.stats.transactions_rate_limited.clone();
+        let receipt_mode = self.receipt_mode;
 
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -465,6 +564,7 @@ impl Consumer {
                                 monitor_addr.clone(),
                                 transactions_sent.clone(),
                                 transactions_sending.clone(),
+                                receipt_mode,
                             ));
                         }
 

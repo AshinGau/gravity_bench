@@ -1,3 +1,4 @@
+pub mod balance_tracker;
 mod mempool_tracker;
 
 pub mod monitor_actor;
@@ -39,6 +40,17 @@ pub enum SubmissionResult {
     },
     ErrorWithRetry,
     Success(TxHash),
+    /// Transaction confirmed on-chain with receipt data.
+    /// Contains gas cost info for balance tracking.
+    SuccessWithReceipt {
+        tx_hash: TxHash,
+        gas_used: u128,
+        effective_gas_price: u128,
+        status: bool,
+    },
+    /// Insufficient balance to submit transaction. The transaction was never sent.
+    /// Nonce should NOT be advanced; account should be retried after re-faucet.
+    InsufficientBalance,
 }
 
 #[derive(Message, Clone)]
@@ -84,6 +96,25 @@ pub struct PlanFailed {
 pub struct RetryTxn {
     pub signed_bytes: Arc<Vec<u8>>,
     pub metadata: Arc<TxnMetadata>,
+}
+
+/// Message sent to Producer when an account needs re-faucet
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct RefaucetNeeded {
+    pub account: Address,
+    #[allow(unused)]
+    pub account_id: crate::util::gen_account::AccountId,
+}
+
+/// Message to initialize balance tracking for all leaf accounts after faucet distribution
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct InitBalances {
+    /// Addresses of all leaf accounts
+    pub addresses: Vec<Address>,
+    /// Initial balance for each account (in wei)
+    pub balance_per_account: alloy::primitives::U256,
 }
 
 /// Information for correcting account nonce

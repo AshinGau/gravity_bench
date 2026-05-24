@@ -8,8 +8,8 @@ use std::time::Duration;
 use crate::actors::consumer::Consumer;
 use crate::actors::monitor::monitor_actor::{PlanProduced, ProduceTxns};
 use crate::actors::monitor::{
-    CorrectNonces, Monitor, PlanCompleted, PlanFailed, RegisterPlan, RegisterProducer,
-    ReportProducerStats, SubmissionResult, UpdateSubmissionResult,
+    CorrectNonces, Monitor, PlanCompleted, PlanFailed, RefaucetNeeded, RegisterPlan,
+    RegisterProducer, ReportProducerStats, SubmissionResult, UpdateSubmissionResult,
 };
 use crate::actors::{ExeFrontPlan, PauseProducer, ResumeProducer};
 use crate::txn_plan::{addr_pool::AddressPool, PlanExecutionMode, PlanId, TxnPlan};
@@ -70,6 +70,8 @@ pub struct Producer {
     nonce_cache: Arc<DashMap<AccountId, u32>>,
 
     account_generator: AccountManager,
+    /// Track which (account_id, nonce) pairs have successfully been processed to prevent double-increment on retry.
+    processed_nonces: Arc<DashMap<(AccountId, u64), ()>>,
 
     /// A queue of plans waiting to be executed. Plans are processed in FIFO order.
     /// Only this queue is subject to max_queue_size limit.
@@ -81,6 +83,10 @@ pub struct Producer {
     plan_responders: HashMap<PlanId, tokio::sync::oneshot::Sender<Result<(), anyhow::Error>>>,
     /// The maximum number of plans allowed in the queue (only applies to plan_queue).
     max_queue_size: usize,
+    /// Chain ID for building re-faucet transactions
+    chain_id: u64,
+    /// Amount of ETH (in whole ETH) to re-faucet when an account runs low
+    refaucet_amount: u64,
 }
 
 impl Producer {
@@ -89,6 +95,8 @@ impl Producer {
         consumer_addr: Addr<Consumer>,
         monitor_addr: Addr<Monitor>,
         account_generator: AccountManager,
+        chain_id: u64,
+        refaucet_amount: u64,
     ) -> Result<Self, anyhow::Error> {
         let nonce_cache = Arc::new(DashMap::new());
         address_pool.clean_ready_accounts();
@@ -111,12 +119,15 @@ impl Producer {
             address_pool,
             nonce_cache,
             account_generator,
+            processed_nonces: Arc::new(DashMap::new()),
             monitor_addr,
             consumer_addr,
             plan_queue: VecDeque::new(),
             awaiting_completion: HashSet::new(),
             plan_responders: HashMap::new(),
             max_queue_size: 10,
+            chain_id,
+            refaucet_amount,
         })
     }
 
@@ -410,7 +421,7 @@ impl Handler<UpdateSubmissionResult> for Producer {
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |val| Some(val.saturating_sub(1)))
             .ok();
         match msg.result.as_ref() {
-            SubmissionResult::Success(_) => {
+            SubmissionResult::Success(_) | SubmissionResult::SuccessWithReceipt { .. } => {
                 self.stats.success_txns += 1;
             }
             SubmissionResult::NonceTooLow { expect_nonce, .. } => {
@@ -421,14 +432,51 @@ impl Handler<UpdateSubmissionResult> for Producer {
             SubmissionResult::ErrorWithRetry => {
                 self.stats.failed_txns += 1;
             }
+            SubmissionResult::InsufficientBalance => {
+                // Not a failure — will be retried after re-faucet
+            }
         }
         let ready_accounts = self.stats.ready_accounts.clone();
+        let processed_nonces = self.processed_nonces.clone();
+        let account_generator = self.account_generator.clone();
         Box::pin(
             async move {
                 let account_id = msg.metadata.from_account_id;
+                let tx_nonce = msg.metadata.nonce;
                 match msg.result.as_ref() {
-                    SubmissionResult::Success(_) => {
-                        address_pool.unlock_next_nonce(account_id);
+                    SubmissionResult::Success(_) | SubmissionResult::SuccessWithReceipt { .. } => {
+                        // Guard against double-increment when a retried tx succeeds.
+                        // Each (account, nonce) pair should only advance the pool once.
+                        let key = (account_id, tx_nonce);
+                        if processed_nonces.insert(key, ()).is_none() {
+                            address_pool.unlock_next_nonce(account_id);
+                        } else {
+                            tracing::debug!(
+                                "Skipping duplicate unlock for account {:?} nonce {}",
+                                account_id, tx_nonce
+                            );
+                        }
+                        // Re-faucet confirmed: unlock the depleted target account so it
+                        // can resume sending transactions with its current nonce.
+                        if msg.metadata.is_refaucet {
+                            if let Some(target_addr) = msg.metadata.refaucet_target {
+                                if let Some(target_id) = account_generator
+                                    .find_account_id_by_address(&target_addr)
+                                {
+                                    address_pool.retry_current_nonce(target_id);
+                                    tracing::debug!(
+                                        "Re-faucet confirmed, unlocked target account {:?}",
+                                        target_addr
+                                    );
+                                }
+                            }
+                        }
+                        if let SubmissionResult::SuccessWithReceipt { status: false, gas_used, effective_gas_price, .. } = msg.result.as_ref() {
+                            tracing::warn!(
+                                "Transaction reverted on-chain: account={:?}, nonce={}, gas_used={}, effective_gas_price={}",
+                                account_id, tx_nonce, gas_used, effective_gas_price
+                            );
+                        }
                     }
                     SubmissionResult::NonceTooLow { expect_nonce, .. } => {
                         tracing::debug!(
@@ -440,7 +488,15 @@ impl Handler<UpdateSubmissionResult> for Producer {
                         address_pool.unlock_correct_nonce(account_id, *expect_nonce as u32);
                     }
                     SubmissionResult::ErrorWithRetry => {
+                        // Allow this nonce to be processed again when retried
+                        processed_nonces.remove(&(account_id, tx_nonce));
                         address_pool.retry_current_nonce(account_id);
+                    }
+                    SubmissionResult::InsufficientBalance => {
+                        // Transaction was never sent — keep same nonce for retry after re-faucet.
+                        // Do NOT return the account to the ready pool yet: the re-faucet must
+                        // confirm first. The is_refaucet path in this handler will unlock it.
+                        processed_nonces.remove(&(account_id, tx_nonce));
                     }
                 }
                 ready_accounts.store(address_pool.ready_len() as u64, Ordering::Relaxed);
@@ -506,6 +562,9 @@ impl Handler<CorrectNonces> for Producer {
                 );
                 // Update nonce cache
                 self.nonce_cache.insert(account_id, correction.expected_nonce as u32);
+                // Clear processed nonces for this account: the correction resets the
+                // nonce, so previously "processed" nonces might need to be re-tried.
+                self.processed_nonces.retain(|&(aid, _), _| aid != account_id);
                 // Unlock the account with the correct nonce
                 self.address_pool
                     .unlock_correct_nonce(account_id, correction.expected_nonce as u32);
@@ -516,5 +575,97 @@ impl Handler<CorrectNonces> for Producer {
 
         // Update ready accounts count
         self.stats.ready_accounts.store(self.address_pool.ready_len() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Handler for re-faucet requests. Builds an ETH transfer from the faucet
+/// account to the depleted account and sends it through the Consumer.
+impl Handler<RefaucetNeeded> for Producer {
+    type Result = ResponseActFuture<Self, ()>;
+
+    fn handle(&mut self, msg: RefaucetNeeded, _ctx: &mut Self::Context) -> Self::Result {
+        let consumer_addr = self.consumer_addr.clone();
+        let _monitor_addr = self.monitor_addr.clone();
+        let account_generator = self.account_generator.clone();
+        let chain_id = self.chain_id;
+        let nonce_cache = self.nonce_cache.clone();
+        let refaucet_amount = self.refaucet_amount;
+
+        Box::pin(
+            async move {
+                use crate::eth::TxnBuilder;
+                use alloy::eips::Encodable2718;
+                use crate::txn_plan::{SignedTxnWithMetadata, TxnMetadata, PlanId};
+                use std::sync::Arc;
+                use uuid::Uuid;
+
+                let faucet_id = account_generator.faucet_accout_id();
+                let faucet_signer = account_generator.get_signer_by_id(faucet_id);
+                let faucet_address = faucet_signer.address();
+
+                // Get faucet nonce from cache or query
+                let nonce = if let Some(n) = nonce_cache.get(&faucet_id) {
+                    *n as u64
+                } else {
+                    tracing::warn!("Faucet nonce not in cache, skipping re-faucet for {:?}", msg.account);
+                    return;
+                };
+
+                // Re-faucet amount from config (in whole ETH)
+                let refaucet_wei = alloy::primitives::U256::from(refaucet_amount)
+                    * alloy::primitives::U256::from(10u64).pow(alloy::primitives::U256::from(18));
+
+                let tx_request = match TxnBuilder::eth_transfer_request(
+                    faucet_address,
+                    msg.account,
+                    refaucet_wei,
+                    nonce,
+                    chain_id,
+                ) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        tracing::error!("Failed to build re-faucet tx for {:?}: {}", msg.account, e);
+                        return;
+                    }
+                };
+
+                let tx_envelope = match TxnBuilder::build_and_sign_transaction(tx_request, &faucet_signer) {
+                    Ok(env) => env,
+                    Err(e) => {
+                        tracing::error!("Failed to sign re-faucet tx for {:?}: {}", msg.account, e);
+                        return;
+                    }
+                };
+
+                let metadata = Arc::new(TxnMetadata {
+                    from_account: Arc::new(faucet_address),
+                    from_account_id: faucet_id,
+                    nonce,
+                    txn_id: Uuid::new_v4(),
+                    plan_id: PlanId::Refaucet,
+                    is_refaucet: true,
+                    refaucet_target: Some(msg.account),
+                });
+
+                let signed_txn = SignedTxnWithMetadata {
+                    bytes: tx_envelope.encoded_2718(),
+                    metadata,
+                };
+
+                // Update faucet nonce in cache
+                nonce_cache.insert(faucet_id, (nonce + 1) as u32);
+
+                tracing::info!(
+                    "Sending re-faucet: {} -> {} ({} wei, nonce {})",
+                    faucet_address, msg.account, refaucet_wei, nonce
+                );
+
+                if let Err(e) = consumer_addr.send(signed_txn).await {
+                    tracing::error!("Failed to send re-faucet transaction to Consumer: {}", e);
+                }
+            }
+            .into_actor(self)
+            .map(|_, _act, _ctx| {}),
+        )
     }
 }

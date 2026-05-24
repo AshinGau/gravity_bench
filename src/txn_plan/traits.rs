@@ -23,12 +23,19 @@ pub struct TxnMetadata {
     pub from_account: Arc<Address>,
     pub from_account_id: AccountId,
     pub nonce: u64,
+    /// Whether this is a re-faucet transaction (ETH transfer to replenish balance)
+    pub is_refaucet: bool,
+    /// When is_refaucet is true, the address of the account receiving the re-faucet ETH.
+    /// This is the depleted account, not the faucet sender.
+    pub refaucet_target: Option<Address>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum PlanId {
     FullCheck(Uuid),
     PartialCheck(Uuid),
+    /// Special plan ID for re-faucet transactions
+    Refaucet,
 }
 
 impl std::fmt::Display for PlanId {
@@ -36,6 +43,7 @@ impl std::fmt::Display for PlanId {
         match self {
             PlanId::FullCheck(id) => write!(f, "FullCheck({})", id),
             PlanId::PartialCheck(id) => write!(f, "PartialCheck({})", id),
+            PlanId::Refaucet => write!(f, "Refaucet"),
         }
     }
 }

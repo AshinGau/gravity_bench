@@ -318,6 +318,31 @@ impl TxnTracker {
                     from_account, expect_nonce, actual_nonce, tx_hash
                 );
             }
+            SubmissionResult::InsufficientBalance => {
+                // Transaction was never submitted — mark as resolved (will be retried)
+                debug!("Transaction marked as insufficient balance: plan_id={}", plan_id);
+                plan_tracker.resolved_transactions += 1;
+                plan_tracker.failed_submissions += 1;
+                self.total_failed_submissions += 1;
+                self.resolved_txn_timestamps.push_back(Instant::now());
+                self.total_resolved_transactions += 1;
+            }
+            SubmissionResult::SuccessWithReceipt { tx_hash, status, .. } => {
+                // Receipt already obtained (receipt mode) — resolve immediately
+                debug!(
+                    "Transaction confirmed with receipt: plan_id={}, tx_hash={}, status={}",
+                    plan_id, tx_hash, status
+                );
+                plan_tracker.resolved_transactions += 1;
+                plan_tracker.resolved_hashes.insert(*tx_hash);
+                self.resolved_txn_timestamps.push_back(Instant::now());
+                self.total_resolved_transactions += 1;
+                if !status {
+                    plan_tracker.failed_executions += 1;
+                    self.total_failed_executions += 1;
+                    warn!("Transaction reverted on-chain: tx_hash={}", tx_hash);
+                }
+            }
             e => {
                 warn!("Transaction submission failed: plan_id={}, error={:?}", plan_id, e);
                 if let Some(tracker) = self.plan_trackers.get_mut(plan_id) {
@@ -482,7 +507,20 @@ impl TxnTracker {
                     if let Ok(account_nonce) = account_nonce {
                         if account_nonce > info.metadata.nonce {
                             successful_txns.push((info, true));
+                        } else if info.submit_time.elapsed() > RETRY_TIMEOUT {
+                            // TX was "successfully sent" but never confirmed after timeout.
+                            // This usually means the tx was lost during broadcast (e.g.,
+                            // PFN accepted it locally but failed to forward to validator).
+                            // Queue for retry so the Consumer re-sends the same bytes.
+                            warn!(
+                                "TX {:?} (nonce={}) pending > {}s without confirmation, queuing for retry",
+                                info.tx_hash,
+                                info.metadata.nonce,
+                                RETRY_TIMEOUT.as_secs()
+                            );
+                            failed_txns.push(info);
                         }
+                        // else: still within RETRY_TIMEOUT, keep in pending_txns
                     } else {
                         failed_txns.push(info);
                     }

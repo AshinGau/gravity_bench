@@ -1,5 +1,12 @@
 # Gravity Bench Configuration File
 
+# Gas price configuration (in Gwei). Defaults: 5000 / 500
+# For Gravity mainnet (50 Gwei base fee), recommended: max_fee_per_gas = 60, max_priority_fee_per_gas = 10
+max_fee_per_gas = 60
+max_priority_fee_per_gas = 10
+# Re-faucet amount (ETH) when --receipt mode detects low balance. Default: 1
+refaucet_amount = 1
+
 # Uniswap configuration file path
 contract_config_path = "deploy.json"
 target_tps = 10000

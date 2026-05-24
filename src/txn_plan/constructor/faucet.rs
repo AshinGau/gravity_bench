@@ -15,9 +15,20 @@ use std::{
 };
 use tracing::info;
 
-// Per-transaction gas cost budget (in wei). Bumped in lockstep with
-// BENCH_MAX_FEE_PER_GAS = 5000 Gwei × worst-case 100k gas = 5e17 wei = 0.5 ETH/txn.
-const GAS_COST_PER_TXN_BUDGET: u64 = 500_000_000_000_000_000;
+/// Format wei as ETH string for panic messages
+fn format_eth(wei: U256) -> String {
+    let eth = wei / U256::from(10u64).pow(U256::from(18));
+    let remainder = wei % U256::from(10u64).pow(U256::from(18));
+    let remainder_str = format!("{:018}", remainder);
+    format!("{}.{}", eth, &remainder_str[..6])
+}
+
+/// Per-transaction gas cost budget (in wei).
+/// Computed from the configured max_fee_per_gas × worst-case 100k gas.
+fn gas_cost_per_txn_budget() -> u64 {
+    let max_fee = crate::eth::get_max_fee_per_gas();
+    (max_fee * 100_000) as u64
+}
 
 static NONCE_MAP: std::sync::OnceLock<Arc<Mutex<HashMap<Address, Arc<AtomicU64>>>>> =
     std::sync::OnceLock::new();
@@ -59,7 +70,7 @@ impl<T: FaucetTxnBuilder + 'static> FaucetTreePlanBuilder<T> {
         let round_total_accounts_num = degree.pow(total_levels as u32);
 
         let degree_u256 = U256::from(degree);
-        let gas_cost_per_txn = U256::from(GAS_COST_PER_TXN_BUDGET);
+        let gas_cost_per_txn = U256::from(gas_cost_per_txn_budget());
 
         let (amount_per_recipient, intermediate_funding_amounts) = if total_levels > 1 {
             // This is a multi-level distribution.
@@ -75,6 +86,25 @@ impl<T: FaucetTxnBuilder + 'static> FaucetTreePlanBuilder<T> {
 
             let total_remained_eth = U256::from(intermediate_txns) * remained_eth;
             let total_cost = total_gas_cost + total_remained_eth;
+            if faucet_balance <= total_cost {
+                panic!(
+                    "Faucet balance ({} wei, {} ETH) is insufficient to cover distribution costs \
+                     ({} wei, {} ETH).\n\
+                     Total transactions: {} ({} intermediate + {} final),\n\
+                     gas_cost_per_txn: {} wei ({} ETH),\n\
+                     remained_eth per intermediate: {} wei ({} ETH).\n\
+                     Increase fauce_eth_balance in config, or reduce faucet_level / num_accounts.",
+                    faucet_balance,
+                    format_eth(faucet_balance),
+                    total_cost,
+                    format_eth(total_cost),
+                    total_txns, intermediate_txns, final_txns,
+                    gas_cost_per_txn,
+                    format_eth(gas_cost_per_txn),
+                    remained_eth,
+                    format_eth(remained_eth),
+                );
+            }
             let amount_for_leaves = faucet_balance - total_cost;
 
             let amount_per_recipient = if total_accounts > 0 {
@@ -100,6 +130,21 @@ impl<T: FaucetTxnBuilder + 'static> FaucetTreePlanBuilder<T> {
         } else {
             // No intermediate levels needed, direct distribution from faucet.
             let total_gas_cost = U256::from(total_accounts) * gas_cost_per_txn;
+            if faucet_balance <= total_gas_cost {
+                panic!(
+                    "Faucet balance ({} wei, {} ETH) is insufficient to cover distribution gas costs \
+                     ({} wei, {} ETH).\n\
+                     Total transactions: {}, gas_cost_per_txn: {} wei ({} ETH).\n\
+                     Increase fauce_eth_balance in config, or reduce num_accounts.",
+                    faucet_balance,
+                    format_eth(faucet_balance),
+                    total_gas_cost,
+                    format_eth(total_gas_cost),
+                    total_accounts,
+                    gas_cost_per_txn,
+                    format_eth(gas_cost_per_txn),
+                );
+            }
             let amount_for_leaves = faucet_balance - total_gas_cost;
             let amount_per_recipient = if total_accounts > 0 {
                 amount_for_leaves / U256::from(total_accounts)
@@ -155,6 +200,11 @@ impl<T: FaucetTxnBuilder + 'static> FaucetTreePlanBuilder<T> {
 
     pub fn total_levels(&self) -> usize {
         self.total_levels
+    }
+
+    /// Returns the ETH amount each leaf account receives.
+    pub fn amount_per_recipient(&self) -> U256 {
+        self.amount_per_recipient
     }
 
     fn calculate_levels(total_accounts: usize, degree: usize) -> usize {

@@ -6,6 +6,7 @@ use alloy::{
     signers::local::PrivateKeySigner,
 };
 use anyhow::Result;
+use std::sync::OnceLock;
 use tracing::debug;
 
 /// Max fee per gas for bench transactions (5000 Gwei).
@@ -15,13 +16,40 @@ use tracing::debug;
 /// gravity-reth txpool promotion threshold. Empirically, transactions with
 /// a 1 Gwei priority fee linger in the `queued` bucket and are never
 /// promoted to `pending`; a tip in the hundreds of Gwei is required.
-pub const BENCH_MAX_FEE_PER_GAS: u128 = 5_000_000_000_000;
+const BENCH_MAX_FEE_PER_GAS: u128 = 5_000_000_000_000;
 
 /// Priority fee (tip) for bench transactions (500 Gwei).
 ///
 /// See `BENCH_MAX_FEE_PER_GAS` — 1 Gwei was below the gravity-reth
 /// txpool promotion threshold under load, so transactions never landed.
-pub const BENCH_MAX_PRIORITY_FEE_PER_GAS: u128 = 500_000_000_000;
+const BENCH_MAX_PRIORITY_FEE_PER_GAS: u128 = 500_000_000_000;
+
+#[derive(Debug)]
+struct GasConfig {
+    max_fee_per_gas: u128,
+    max_priority_fee_per_gas: u128,
+}
+
+static GAS_CONFIG: OnceLock<GasConfig> = OnceLock::new();
+
+/// Initialize gas price configuration from Gwei values.
+/// Must be called once before any transactions are built.
+pub fn init_gas_config(max_fee_gwei: u64, max_priority_fee_gwei: u64) {
+    GAS_CONFIG
+        .set(GasConfig {
+            max_fee_per_gas: (max_fee_gwei as u128) * 1_000_000_000,
+            max_priority_fee_per_gas: (max_priority_fee_gwei as u128) * 1_000_000_000,
+        })
+        .expect("Gas config already initialized");
+}
+
+pub fn get_max_fee_per_gas() -> u128 {
+    GAS_CONFIG.get().map(|c| c.max_fee_per_gas).unwrap_or(BENCH_MAX_FEE_PER_GAS)
+}
+
+pub fn get_max_priority_fee_per_gas() -> u128 {
+    GAS_CONFIG.get().map(|c| c.max_priority_fee_per_gas).unwrap_or(BENCH_MAX_PRIORITY_FEE_PER_GAS)
+}
 
 /// TxnBuilder - Build and sign transactions
 pub struct TxnBuilder;
@@ -72,8 +100,8 @@ impl TxnBuilder {
             .with_value(eth_amount)
             .with_nonce(nonce)
             .with_chain_id(chain_id)
-            .with_max_priority_fee_per_gas(BENCH_MAX_PRIORITY_FEE_PER_GAS)
-            .with_max_fee_per_gas(BENCH_MAX_FEE_PER_GAS)
+            .with_max_priority_fee_per_gas(get_max_priority_fee_per_gas())
+            .with_max_fee_per_gas(get_max_fee_per_gas())
             .with_gas_limit(300_000);
 
         Ok(tx_request)
@@ -93,8 +121,8 @@ impl TxnBuilder {
             .with_value(amount)
             .with_nonce(nonce)
             .with_chain_id(chain_id)
-            .with_max_priority_fee_per_gas(BENCH_MAX_PRIORITY_FEE_PER_GAS)
-            .with_max_fee_per_gas(BENCH_MAX_FEE_PER_GAS)
+            .with_max_priority_fee_per_gas(get_max_priority_fee_per_gas())
+            .with_max_fee_per_gas(get_max_fee_per_gas())
             .with_gas_limit(100_000);
 
         Ok(tx_request)
@@ -112,8 +140,8 @@ impl TxnBuilder {
             .with_value(amount)
             .with_nonce(nonce)
             .with_chain_id(chain_id)
-            .with_max_priority_fee_per_gas(BENCH_MAX_PRIORITY_FEE_PER_GAS)
-            .with_max_fee_per_gas(BENCH_MAX_FEE_PER_GAS)
+            .with_max_priority_fee_per_gas(get_max_priority_fee_per_gas())
+            .with_max_fee_per_gas(get_max_fee_per_gas())
             .with_gas_limit(100_000);
 
         Ok(tx_request)

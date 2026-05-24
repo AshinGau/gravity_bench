@@ -15,12 +15,15 @@ use crate::txn_plan::PlanId;
 use super::mempool_tracker::MempoolAction;
 use super::txn_tracker::{BackpressureAction, PlanStatus, TxnTracker};
 use super::{
-    CorrectNonces, PlanCompleted, PlanFailed, RegisterConsumer, RegisterPlan, RegisterProducer,
-    ReportProducerStats, RetryTxn, Tick, UpdateSubmissionResult,
+    CorrectNonces, InitBalances, PlanCompleted, PlanFailed, RefaucetNeeded, RegisterConsumer,
+    RegisterPlan, RegisterProducer, ReportProducerStats, RetryTxn, SubmissionResult, Tick,
+    UpdateSubmissionResult,
 };
 use crate::actors::{PauseProducer, ResumeProducer};
 
 use crate::config::SamplingPolicy;
+
+use super::balance_tracker::BalanceTracker;
 
 #[derive(Message)]
 #[rtype(result = "()")]
@@ -36,6 +39,10 @@ pub struct Monitor {
     txn_tracker: TxnTracker,
     mempool_tracker: MempoolTracker,
     clients: Arc<HashMap<Arc<String>, Arc<EthHttpCli>>>,
+    /// Per-account ETH balance tracker (only active in receipt mode)
+    balance_tracker: Option<BalanceTracker>,
+    /// When true, skip txpool_content nonce correction (unnecessary with per-tx receipt)
+    receipt_mode: bool,
 }
 
 impl Monitor {
@@ -43,6 +50,7 @@ impl Monitor {
         clients: Vec<std::sync::Arc<EthHttpCli>>,
         max_pool_size: usize,
         sampling_policy: SamplingPolicy,
+        receipt_mode: bool,
     ) -> Self {
         Self {
             producer_addr: None,
@@ -50,7 +58,16 @@ impl Monitor {
             txn_tracker: TxnTracker::new(clients.clone(), sampling_policy),
             mempool_tracker: MempoolTracker::new(max_pool_size),
             clients: Arc::new(clients.into_iter().map(|client| (client.rpc(), client)).collect()),
+            balance_tracker: None,
+            receipt_mode,
         }
+    }
+
+    /// Enable balance tracking for receipt mode.
+    /// `threshold_gwei`: re-faucet when balance drops below this (Gwei)
+    /// `refaucet_eth`: amount to re-faucet (whole ETH)
+    pub fn enable_balance_tracking(&mut self, threshold_gwei: u64, refaucet_eth: u64) {
+        self.balance_tracker = Some(BalanceTracker::new(threshold_gwei, refaucet_eth));
     }
 
     /// Notify Producer of plan status changes
@@ -97,8 +114,11 @@ impl Actor for Monitor {
                                 Ok((pending, queued, action)) => {
                                     act.txn_tracker.update_mempool_stats(pending, queued);
 
-                                    // Handle nonce correction if needed
-                                    if matches!(action, MempoolAction::NeedsNonceCorrection) {
+                                    // Handle nonce correction if needed.
+                                    // Skip in receipt mode: nonce is always accurate.
+                                    if !act.receipt_mode
+                                        && matches!(action, MempoolAction::NeedsNonceCorrection)
+                                    {
                                         let clients = act.clients.clone();
                                         let producer = producer_addr.clone();
                                         ctx.spawn(
@@ -190,7 +210,59 @@ impl Handler<UpdateSubmissionResult> for Monitor {
         }
 
         match msg.result.as_ref() {
-            crate::actors::monitor::SubmissionResult::ErrorWithRetry => {
+            SubmissionResult::SuccessWithReceipt { gas_used, effective_gas_price, .. } => {
+                if msg.metadata.is_refaucet {
+                    // This is a re-faucet transaction — credit the target (depleted) account
+                    if let Some(tracker) = &mut self.balance_tracker {
+                        if let Some(target_addr) = msg.metadata.refaucet_target {
+                            let refaucet_amount = tracker.refaucet_amount();
+                            tracker.credit(&target_addr, refaucet_amount);
+                            tracing::info!("Re-faucet confirmed for {:?}, credited {} wei", target_addr, refaucet_amount);
+                        }
+                    }
+                } else {
+                    // Normal transaction — deduct gas and check if re-faucet is needed
+                    if let Some(tracker) = &mut self.balance_tracker {
+                        let address = msg.metadata.from_account.as_ref();
+                        if let Some(remaining) = tracker.deduct_gas(address, *gas_used, *effective_gas_price) {
+                            if tracker.needs_refaucet(address) {
+                                let refaucet_amount = tracker.refaucet_amount();
+                                tracing::info!(
+                                    "Account {:?} balance low ({} wei), requesting re-faucet of {} wei",
+                                    address, remaining, refaucet_amount
+                                );
+                                if let Some(producer) = &self.producer_addr {
+                                    producer.do_send(RefaucetNeeded {
+                                        account: *address,
+                                        account_id: msg.metadata.from_account_id,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also pass to txn_tracker for plan completion tracking
+                self.txn_tracker.handle_submission_result(&msg);
+            }
+            SubmissionResult::InsufficientBalance => {
+                // Transaction never sent due to low balance — trigger re-faucet
+                if self.balance_tracker.is_some() {
+                    let address = msg.metadata.from_account.as_ref();
+                    tracing::info!(
+                        "Insufficient balance for {:?}, requesting re-faucet",
+                        address
+                    );
+                    if let Some(producer) = &self.producer_addr {
+                        producer.do_send(RefaucetNeeded {
+                            account: *address,
+                            account_id: msg.metadata.from_account_id,
+                        });
+                    }
+                }
+                // Do NOT tell txn_tracker — the transaction was never submitted
+                // The Producer will put the account back in the ready pool
+            }
+            SubmissionResult::ErrorWithRetry => {
                 // If the transaction failed submission, retry it endlessly to prevent nonce gaps
                 // and premature plan completion. Do NOT tell TxnTracker about the failure yet.
                 tracing::warn!(
@@ -320,5 +392,22 @@ impl Handler<PlanFailed> for Monitor {
     fn handle(&mut self, msg: PlanFailed, _ctx: &mut Self::Context) {
         tracing::warn!("Plan {} failed: {}", msg.plan_id, msg.reason);
         self.txn_tracker.mark_plan_failed(msg.plan_id);
+    }
+}
+
+impl Handler<InitBalances> for Monitor {
+    type Result = ();
+
+    fn handle(&mut self, msg: InitBalances, _ctx: &mut Self::Context) {
+        if let Some(tracker) = &mut self.balance_tracker {
+            for address in &msg.addresses {
+                tracker.set_balance(*address, msg.balance_per_account);
+            }
+            tracing::info!(
+                "Balance tracker initialized for {} accounts ({} wei each)",
+                msg.addresses.len(),
+                msg.balance_per_account
+            );
+        }
     }
 }

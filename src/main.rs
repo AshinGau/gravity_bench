@@ -48,6 +48,10 @@ struct Args {
 
     #[arg(long)]
     accounts_output: Option<String>,
+
+    /// Wait for on-chain receipt before advancing nonce (safe mode, lower throughput)
+    #[arg(long, default_value_t = false)]
+    receipt: bool,
 }
 
 /// Snapshot persisted between runs for deterministic recovery.
@@ -257,6 +261,12 @@ async fn start_bench() -> Result<()> {
     let benchmark_config = BenchConfig::load(&args.config).unwrap();
     assert!(benchmark_config.accounts.num_accounts >= benchmark_config.target_tps as usize);
 
+    // Initialize gas price configuration from bench config
+    crate::eth::init_gas_config(
+        benchmark_config.max_fee_per_gas,
+        benchmark_config.max_priority_fee_per_gas,
+    );
+
     // Initialize tracing
     let log_path = benchmark_config.log_path.trim();
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
@@ -393,9 +403,12 @@ async fn start_bench() -> Result<()> {
         start_nonce,
         account_addresses.clone(),
         Arc::new(EthFaucetTxnBuilder),
+        // remained_eth: ETH left on each intermediate account after forwarding.
+        // Use max_fee_per_gas (Gwei) × 21000 gas as a reasonable leftover.
         U256::from(benchmark_config.num_tokens)
             * U256::from(21000)
-            * U256::from(1000_000_000_000u64),
+            * U256::from(benchmark_config.max_fee_per_gas)
+            * U256::from(1_000_000_000u64),
         &mut accout_generator,
     )
     .await
@@ -403,12 +416,21 @@ async fn start_bench() -> Result<()> {
     if args.recover {
         init_nonce(&mut accout_generator, eth_clients[0].clone()).await;
     }
-    let monitor = Monitor::new_with_clients(
+    let mut monitor = Monitor::new_with_clients(
         eth_clients.clone(),
         benchmark_config.performance.max_pool_size,
         benchmark_config.performance.sampling,
-    )
-    .start();
+        args.receipt,
+    );
+    // Enable balance tracking in receipt mode
+    if args.receipt {
+        // Threshold: enough for 10 transactions at max_fee_per_gas
+        let threshold_gwei = benchmark_config.max_fee_per_gas * 100_000 * 10;
+        monitor.enable_balance_tracking(threshold_gwei, benchmark_config.refaucet_amount);
+        info!("Receipt mode: balance tracking enabled (threshold={} Gwei, refaucet={} ETH)",
+              threshold_gwei, benchmark_config.refaucet_amount);
+    }
+    let monitor = monitor.start();
 
     let tokens = contract_config.get_all_token();
     let mut tokens_plan = Vec::new();
@@ -468,6 +490,7 @@ async fn start_bench() -> Result<()> {
         monitor.clone(),
         benchmark_config.performance.max_pool_size,
         Some(benchmark_config.target_tps as u32),
+        args.receipt,
     )
     .start();
     let init_nonce_map = get_init_nonce_map(
@@ -477,10 +500,11 @@ async fn start_bench() -> Result<()> {
     )
     .await;
 
-    let producer = Producer::new(address_pool.clone(), consumer, monitor, account_manager.clone())
+    let producer = Producer::new(address_pool.clone(), consumer, monitor.clone(), account_manager.clone(), chain_id, benchmark_config.refaucet_amount)
         .await
         .unwrap()
         .start();
+    let amount_per_recipient = eth_faucet_builder.amount_per_recipient();
     execute_faucet_distribution(
         eth_faucet_builder,
         chain_id,
@@ -490,6 +514,19 @@ async fn start_bench() -> Result<()> {
         init_nonce_map.clone(),
     )
     .await?;
+
+    // Initialize balance tracker for receipt mode
+    if args.receipt {
+        use crate::actors::monitor::InitBalances;
+        let addresses: Vec<alloy::primitives::Address> = account_addresses
+            .iter()
+            .map(|a| **a)
+            .collect();
+        monitor.do_send(InitBalances {
+            addresses,
+            balance_per_account: amount_per_recipient,
+        });
+    }
 
     for (token_plan, token) in tokens_plan.into_iter().zip(tokens.iter()) {
         execute_faucet_distribution(

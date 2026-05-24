@@ -103,6 +103,8 @@ impl<C: FromTxnConstructor> TxnPlan for ManyToOnePlan<C> {
                                 txn_id: Uuid::new_v4(),
                                 from_account_id: *from_account_id,
                                 plan_id: plan_id.clone(),
+                                is_refaucet: false,
+                                refaucet_target: None,
                             });
                             let tx_envelope =
                                 TxnBuilder::build_and_sign_transaction(tx_request, &signer)
@@ -212,6 +214,8 @@ impl<C: ToTxnConstructor> TxnPlan for OneToManyPlan<C> {
                                         nonce: 0,
                                         txn_id: Uuid::new_v4(),
                                         plan_id: plan_id.clone(),
+                                        is_refaucet: false,
+                                        refaucet_target: None,
                                     });
                                     SignedTxnWithMetadata {
                                         bytes: tx_envelope.encoded_2718(),

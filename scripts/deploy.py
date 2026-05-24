@@ -11,14 +11,11 @@ from solcx import compile_files, install_solc, set_solc_version
 SOLC_VERSIONS = ["0.8.20", "0.6.6", "0.5.16"]
 ZERO_ADDRESS = "0x0000000000000000000000000000000000000000"
 
-# Gas price for legacy deployment / setup transactions.
-# Aligned with bench's BENCH_MAX_PRIORITY_FEE_PER_GAS (500 Gwei) so legacy
-# txs from this script clear the same gravity-reth txpool promotion
-# threshold bench's EIP-1559 txs do. Using w3.eth.gas_price returns
-# ~baseFee + 1 Gwei which is below the threshold and leaves deploy txs
-# stuck in `queued`. Kept under the 1 ETH RPC txfeecap for typical
-# contract gas limits.
-DEPLOY_GAS_PRICE_WEI = 800_000_000_000  # 800 Gwei
+# EIP-1559 gas configuration for deployment transactions.
+# Aligned with bench config (max_fee_per_gas = 60, max_priority_fee_per_gas = 10).
+# Using EIP-1559 (Type 2) instead of legacy (Type 0) to save gas costs.
+DEPLOY_MAX_FEE_PER_GAS = 60_000_000_000  # 60 Gwei
+DEPLOY_MAX_PRIORITY_FEE_PER_GAS = 10_000_000_000  # 10 Gwei
 
 def filter_abi(full_abi, function_names):
     """Filters an ABI, keeping only specified functions and essential parts like the constructor."""
@@ -134,7 +131,6 @@ def deploy_contract(w3, account, private_key, contract_interface, contract_name,
     Contract = w3.eth.contract(abi=contract_interface['abi'], bytecode=contract_interface['bin'])
     
     nonce = w3.eth.get_transaction_count(account.address)
-    gas_price = DEPLOY_GAS_PRICE_WEI
 
     try:
         gas_limit = int(Contract.constructor(*args).estimate_gas({'from': account.address}) * 1.2)
@@ -143,7 +139,9 @@ def deploy_contract(w3, account, private_key, contract_interface, contract_name,
 
     tx = Contract.constructor(*args).build_transaction({
         'from': account.address, 'nonce': nonce,
-        'gas': gas_limit, 'gasPrice': gas_price
+        'gas': gas_limit,
+        'maxFeePerGas': DEPLOY_MAX_FEE_PER_GAS,
+        'maxPriorityFeePerGas': DEPLOY_MAX_PRIORITY_FEE_PER_GAS
     })
     
     receipt = send_transaction(w3, tx, private_key, f"Deploy {contract_name}")
@@ -166,7 +164,8 @@ def approve_token(w3, account, private_key, token_contract, spender_address, tok
         'from': account.address,
         'nonce': w3.eth.get_transaction_count(account.address),
         'gas': 100000,
-        'gasPrice': DEPLOY_GAS_PRICE_WEI
+        'maxFeePerGas': DEPLOY_MAX_FEE_PER_GAS,
+        'maxPriorityFeePerGas': DEPLOY_MAX_PRIORITY_FEE_PER_GAS
     })
     
     return send_transaction(w3, tx, private_key, f"Approve {token_symbol}") is not None
@@ -186,7 +185,9 @@ def add_liquidity(w3, account, private_key, router_contract, token_a_info, token
         0, 0, account.address, deadline
     ).build_transaction({
         'from': account.address, 'nonce': w3.eth.get_transaction_count(account.address),
-        'gas': 3_000_000, 'gasPrice': DEPLOY_GAS_PRICE_WEI
+        'gas': 3_000_000,
+        'maxFeePerGas': DEPLOY_MAX_FEE_PER_GAS,
+        'maxPriorityFeePerGas': DEPLOY_MAX_PRIORITY_FEE_PER_GAS
     })
     
     receipt = send_transaction(w3, tx, private_key, f"Add Liquidity for {pair_name}")
@@ -207,7 +208,9 @@ def add_liquidity_eth(w3, account, private_key, router_contract, token_info):
     ).build_transaction({
         'from': account.address, 'value': eth_amount,
         'nonce': w3.eth.get_transaction_count(account.address),
-        'gas': 3_000_000, 'gasPrice': DEPLOY_GAS_PRICE_WEI
+        'gas': 3_000_000,
+        'maxFeePerGas': DEPLOY_MAX_FEE_PER_GAS,
+        'maxPriorityFeePerGas': DEPLOY_MAX_PRIORITY_FEE_PER_GAS
     })
     
     receipt = send_transaction(w3, tx, private_key, f"Add Liquidity for {pair_name}")

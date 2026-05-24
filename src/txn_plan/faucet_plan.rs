@@ -170,6 +170,8 @@ impl<T: FaucetTxnBuilder + 'static> TxnPlan for LevelFaucetPlan<T> {
                             from_account_id: *sender_signer_id,
                             txn_id: Uuid::new_v4(),
                             plan_id: plan_id.clone(),
+                            is_refaucet: false,
+                            refaucet_target: None,
                         });
 
                         tx.send(SignedTxnWithMetadata {
